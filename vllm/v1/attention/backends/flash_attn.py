@@ -25,6 +25,11 @@ from vllm.v1.attention.backends.fa_utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.triton_hadamard import hadamard_rotate
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    get_turboquant_codebook,
+    turboquant_pack_and_cache_flash,
+)
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import (
@@ -33,6 +38,10 @@ if is_flash_attn_varlen_func_available():
         get_scheduler_metadata,
         reshape_and_cache_flash,
     )
+    try:
+        from flash_attn import dequant_paged_kv_fused
+    except ImportError:
+        dequant_paged_kv_fused = None
 import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
@@ -125,6 +134,9 @@ class FlashAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "truboquant":
+            return head_size // 2
+
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         return (2, num_blocks, block_size, num_kv_heads, head_size)
@@ -696,8 +708,61 @@ class FlashAttentionImpl(AttentionImpl):
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
 
+        is_turboquant = (
+            key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+            and key_cache.ndim == 4
+            and value_cache.ndim == 4
+            and dequant_paged_kv_fused is not None
+        )
+
+        if is_turboquant:
+            q_rot = hadamard_rotate(query[:num_actual_tokens])
+            codebook = get_turboquant_codebook(
+                query.dtype, query.device,
+            )
+            block_table = attn_metadata.block_table
+            batch_size = block_table.shape[0]
+            page_size = key_cache.shape[1]
+            head_dim = key_cache.shape[-1] * 2
+            k_dequant, v_dequant = dequant_paged_kv_fused(
+                key_cache,
+                value_cache,
+                block_table,
+                codebook,
+                page_size,
+                head_dim,
+                self.num_kv_heads,
+                attn_metadata.max_seq_len,
+                batch_size,
+            )
+            sliding_window_size = (
+                list(self.sliding_window)
+                if self.sliding_window is not None
+                else None
+            )
+            flash_attn_varlen_func(
+                q=q_rot,
+                k=k_dequant,
+                v=v_dequant,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=attn_metadata.causal,
+                alibi_slopes=self.alibi_slopes,
+                window_size=sliding_window_size,
+                block_table=block_table,
+                softcap=self.logits_soft_cap,
+                fa_version=self.vllm_flash_attn_version,
+                num_splits=attn_metadata.max_num_splits,
+                s_aux=self.sinks,
+            )
+            return output
+
         if self.kv_cache_dtype.startswith("fp8"):
-            # queries are quantized in the attention layer
             dtype = FlashAttentionBackend.get_fp8_dtype_for_flashattn(
                 self.kv_cache_dtype
             )
@@ -807,6 +872,26 @@ class FlashAttentionImpl(AttentionImpl):
 
         key_cache, value_cache = kv_cache.unbind(0)
 
+        if (
+            key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+            and key_cache.ndim == 4
+            and value_cache.ndim == 4
+            and key.shape[-1] % 2 == 0
+            and value.shape[-1] % 2 == 0
+            and key_cache.shape[-1] * 2 == key.shape[-1]
+            and value_cache.shape[-1] * 2 == value.shape[-1]
+        ):
+            key = hadamard_rotate(key)
+            value = hadamard_rotate(value)
+            turboquant_pack_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+            )
+            return
         # Reshape the input keys and values and store them in the cache.
         # Skip this if sharing KV cache with an earlier attention layer.
         # NOTE(woosuk): Here, key and value are padded while slot_mapping is

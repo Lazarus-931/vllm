@@ -6,6 +6,64 @@ import torch
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+_TQ_INT4_BOUNDARIES = (
+    0.25822,
+    0.52241,
+    0.79955,
+    1.09929,
+    1.43714,
+    1.84354,
+    2.40081,
+)
+
+_TQ_INT4_CODEBOOK_16 = (
+    0.12821, 0.38806, 0.65619, 0.94222, 1.25616, 1.62429, 2.08578, 2.73276,
+    -0.12821, -0.38806, -0.65619, -0.94222, -1.25616, -1.62429, -2.08578, -2.73276,
+)
+
+
+def turboquant_pack_and_cache_flash(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    if key_cache.ndim != 4 or value_cache.ndim != 4:
+        raise ValueError("turboquant packed cache expects 4D key/value cache tensors")
+    if key_cache.dtype != torch.uint8 or value_cache.dtype != torch.uint8:
+        raise ValueError("turboquant packed cache expects uint8 key/value cache tensors")
+    if key.shape[-1] % 2 != 0 or value.shape[-1] % 2 != 0:
+        raise ValueError("turboquant packed cache expects even head size")
+    if key_cache.shape[-1] * 2 != key.shape[-1]:
+        raise ValueError("key cache last dim must be head_size // 2")
+    if value_cache.shape[-1] * 2 != value.shape[-1]:
+        raise ValueError("value cache last dim must be head_size // 2")
+
+    bounds = key.new_tensor(_TQ_INT4_BOUNDARIES)
+    key_mag = torch.bucketize(torch.abs(key), bounds).to(torch.uint8)
+    val_mag = torch.bucketize(torch.abs(value), bounds).to(torch.uint8)
+    key_idx = key_mag | ((key < 0).to(torch.uint8) << 3)
+    val_idx = val_mag | ((value < 0).to(torch.uint8) << 3)
+
+    key_pack = key_idx[..., 0::2] | (key_idx[..., 1::2] << 4)
+    val_pack = val_idx[..., 0::2] | (val_idx[..., 1::2] << 4)
+
+    valid = slot_mapping >= 0
+    if not torch.any(valid):
+        return
+    slots = slot_mapping[valid].to(torch.int64)
+    block_size = key_cache.shape[1]
+    block_idx = slots // block_size
+    block_off = slots % block_size
+
+    key_cache[block_idx, block_off] = key_pack[valid]
+    value_cache[block_idx, block_off] = val_pack[valid]
+
+
+def get_turboquant_codebook(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    return torch.tensor(_TQ_INT4_CODEBOOK_16, dtype=dtype, device=device)
+
 
 @triton.jit
 def reshape_and_cache_kernel_flash(
