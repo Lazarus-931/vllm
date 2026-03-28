@@ -134,8 +134,8 @@ class FlashAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        if cache_dtype_str == "truboquant":
-            return head_size // 2
+        if cache_dtype_str == "turboquant":
+            return (2, num_blocks, block_size, num_kv_heads, head_size // 2)
 
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")

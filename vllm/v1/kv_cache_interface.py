@@ -67,6 +67,7 @@ class AttentionSpec(KVCacheSpec):
     head_size: int
     dtype: torch.dtype
     page_size_padded: int | None = None
+    packed_factor: int = 1
 
     @property
     def page_size_bytes(self) -> int:
@@ -82,7 +83,7 @@ class AttentionSpec(KVCacheSpec):
             2
             * self.block_size
             * self.num_kv_heads
-            * self.head_size
+            * (self.head_size // self.packed_factor)
             * get_dtype_size(self.dtype)
         )
 

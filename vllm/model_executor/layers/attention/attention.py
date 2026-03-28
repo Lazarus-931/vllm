@@ -557,6 +557,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size=self.head_size,
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
+                packed_factor=2 if self.kv_cache_dtype == "turboquant" else 1,
             )
 
 
