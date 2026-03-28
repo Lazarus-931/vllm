@@ -75,6 +75,7 @@ class FlashAttentionBackend(AttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        "turboquant", # not a torch.dtype, rather a vLLM cache mode label
     ]
 
     @staticmethod
@@ -179,7 +180,7 @@ class FlashAttentionBackend(AttentionBackend):
             return True
         if kv_cache_dtype.startswith("fp8"):
             return flash_attn_supports_fp8()
-        return kv_cache_dtype in ["auto", "float16", "bfloat16"]
+        return kv_cache_dtype in ["auto", "float16", "bfloat16", "turboquant"]
 
     @classmethod
     def supports_sink(cls) -> bool:

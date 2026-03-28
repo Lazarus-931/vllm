@@ -1,3 +1,4 @@
+
 // clang-format off
 // Adapted from: https://github.com/meta-pytorch/applied-ai/blob/main/kernels/cuda/inference/hadamard_transform/hadamard_transform_cuda.cu
 

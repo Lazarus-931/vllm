@@ -2527,6 +2527,22 @@ def reshape_and_cache_flash(
     )
 
 
+def turboquant_quantize_pack_and_cache(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    torch.ops._C_cache_ops.turboquant_quantize_pack_and_cache(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+    )
+
+
 def concat_and_cache_mla(
     kv_c: torch.Tensor,
     k_pe: torch.Tensor,

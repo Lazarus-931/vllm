@@ -5,21 +5,18 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
-
-_TQ_INT4_BOUNDARIES = (
-    0.25822,
-    0.52241,
-    0.79955,
-    1.09929,
-    1.43714,
-    1.84354,
-    2.40081,
-)
+from vllm import _custom_ops as ops
 
 _TQ_INT4_CODEBOOK_16 = (
     0.12821, 0.38806, 0.65619, 0.94222, 1.25616, 1.62429, 2.08578, 2.73276,
     -0.12821, -0.38806, -0.65619, -0.94222, -1.25616, -1.62429, -2.08578, -2.73276,
 )
+
+_tq_codebook_cache: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
+
+
+def _cache_key(device: torch.device, dtype: torch.dtype) -> tuple[str, int | None, torch.dtype]:
+    return (device.type, device.index, dtype)
 
 
 def turboquant_pack_and_cache_flash(
@@ -40,29 +37,22 @@ def turboquant_pack_and_cache_flash(
     if value_cache.shape[-1] * 2 != value.shape[-1]:
         raise ValueError("value cache last dim must be head_size // 2")
 
-    bounds = key.new_tensor(_TQ_INT4_BOUNDARIES)
-    key_mag = torch.bucketize(torch.abs(key), bounds).to(torch.uint8)
-    val_mag = torch.bucketize(torch.abs(value), bounds).to(torch.uint8)
-    key_idx = key_mag | ((key < 0).to(torch.uint8) << 3)
-    val_idx = val_mag | ((value < 0).to(torch.uint8) << 3)
-
-    key_pack = key_idx[..., 0::2] | (key_idx[..., 1::2] << 4)
-    val_pack = val_idx[..., 0::2] | (val_idx[..., 1::2] << 4)
-
-    valid = slot_mapping >= 0
-    if not torch.any(valid):
-        return
-    slots = slot_mapping[valid].to(torch.int64)
-    block_size = key_cache.shape[1]
-    block_idx = slots // block_size
-    block_off = slots % block_size
-
-    key_cache[block_idx, block_off] = key_pack[valid]
-    value_cache[block_idx, block_off] = val_pack[valid]
+    ops.turboquant_quantize_pack_and_cache(
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+    )
 
 
 def get_turboquant_codebook(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    return torch.tensor(_TQ_INT4_CODEBOOK_16, dtype=dtype, device=device)
+    key = _cache_key(device, dtype)
+    codebook = _tq_codebook_cache.get(key)
+    if codebook is None:
+        codebook = torch.tensor(_TQ_INT4_CODEBOOK_16, dtype=dtype, device=device)
+        _tq_codebook_cache[key] = codebook
+    return codebook
 
 
 @triton.jit

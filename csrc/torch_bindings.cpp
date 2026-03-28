@@ -700,6 +700,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
   cache_ops.impl("reshape_and_cache_flash", torch::kCUDA,
                  &reshape_and_cache_flash);
 
+  cache_ops.def(
+      "turboquant_quantize_pack_and_cache(Tensor key, Tensor value,"
+      "                                   Tensor! key_cache,"
+      "                                   Tensor! value_cache,"
+      "                                   Tensor slot_mapping) -> ()");
+  cache_ops.impl("turboquant_quantize_pack_and_cache", torch::kCUDA,
+                 &turboquant_quantize_pack_and_cache);
+
   // Concat kv_c and k_pe and cache them.
   cache_ops.def(
       "concat_and_cache_mla(Tensor kv_c, Tensor k_pe,"

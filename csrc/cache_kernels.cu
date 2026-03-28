@@ -672,6 +672,157 @@ void reshape_and_cache_flash(
                              CALL_RESHAPE_AND_CACHE_FLASH);
 }
 
+namespace vllm {
+
+template <typename scalar_t>
+__device__ __forceinline__ float scalar_to_float(scalar_t x) {
+  return static_cast<float>(x);
+}
+
+__device__ __forceinline__ uint8_t turboquant_encode_4bit(float x) {
+  constexpr float kBoundaries[7] = {
+      0.25822f, 0.52241f, 0.79955f, 1.09929f, 1.43714f, 1.84354f, 2.40081f};
+  float abs_x = fabsf(x);
+  uint8_t mag = 0;
+#pragma unroll
+  for (int i = 0; i < 7; ++i) {
+    mag += static_cast<uint8_t>(abs_x >= kBoundaries[i]);
+  }
+  uint8_t sign = static_cast<uint8_t>(x < 0.0f);
+  return mag | (sign << 3);
+}
+
+template <typename scalar_t>
+__global__ void turboquant_quantize_pack_and_cache_kernel(
+    const scalar_t* __restrict__ key,    // [num_tokens, num_heads, head_size]
+    const scalar_t* __restrict__ value,  // [num_tokens, num_heads, head_size]
+    uint8_t* __restrict__ key_cache,     // [num_blocks, block_size, num_heads, head_size / 2]
+    uint8_t* __restrict__ value_cache,   // [num_blocks, block_size, num_heads, head_size / 2]
+    const int64_t* __restrict__ slot_mapping,
+    const int64_t key_stride_0,
+    const int64_t key_stride_1,
+    const int64_t value_stride_0,
+    const int64_t value_stride_1,
+    const int64_t key_cache_stride_0,
+    const int64_t key_cache_stride_1,
+    const int64_t key_cache_stride_2,
+    const int64_t value_cache_stride_0,
+    const int64_t value_cache_stride_1,
+    const int64_t value_cache_stride_2,
+    const int block_size,
+    const int head_size) {
+  const int token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int64_t slot_idx = slot_mapping[token_idx];
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int packed_head_size = head_size / 2;
+  const int64_t block_idx = slot_idx / block_size;
+  const int64_t block_offset = slot_idx % block_size;
+
+  const scalar_t* key_src = key + token_idx * key_stride_0 + head_idx * key_stride_1;
+  const scalar_t* value_src =
+      value + token_idx * value_stride_0 + head_idx * value_stride_1;
+  uint8_t* key_dst = key_cache + block_idx * key_cache_stride_0 +
+                     block_offset * key_cache_stride_1 +
+                     head_idx * key_cache_stride_2;
+  uint8_t* value_dst = value_cache + block_idx * value_cache_stride_0 +
+                       block_offset * value_cache_stride_1 +
+                       head_idx * value_cache_stride_2;
+
+  for (int packed_idx = threadIdx.x; packed_idx < packed_head_size;
+       packed_idx += blockDim.x) {
+    const int elem_idx = packed_idx * 2;
+
+    uint8_t key_lo = turboquant_encode_4bit(scalar_to_float(key_src[elem_idx]));
+    uint8_t key_hi =
+        turboquant_encode_4bit(scalar_to_float(key_src[elem_idx + 1]));
+    uint8_t value_lo =
+        turboquant_encode_4bit(scalar_to_float(value_src[elem_idx]));
+    uint8_t value_hi =
+        turboquant_encode_4bit(scalar_to_float(value_src[elem_idx + 1]));
+
+    key_dst[packed_idx] = key_lo | (key_hi << 4);
+    value_dst[packed_idx] = value_lo | (value_hi << 4);
+  }
+}
+
+}  // namespace vllm
+
+void turboquant_quantize_pack_and_cache(
+    torch::Tensor& key,        // [num_tokens, num_heads, head_size]
+    torch::Tensor& value,      // [num_tokens, num_heads, head_size]
+    torch::Tensor& key_cache,  // [num_blocks, block_size, num_heads, head_size / 2]
+    torch::Tensor& value_cache, torch::Tensor& slot_mapping) {
+  TORCH_CHECK(key.is_cuda(), "key must be a CUDA tensor");
+  TORCH_CHECK(value.is_cuda(), "value must be a CUDA tensor");
+  TORCH_CHECK(key_cache.is_cuda(), "key_cache must be a CUDA tensor");
+  TORCH_CHECK(value_cache.is_cuda(), "value_cache must be a CUDA tensor");
+  TORCH_CHECK(slot_mapping.is_cuda(), "slot_mapping must be a CUDA tensor");
+  TORCH_CHECK(key.scalar_type() == value.scalar_type(),
+              "key and value must have the same dtype");
+  TORCH_CHECK(key_cache.scalar_type() == at::ScalarType::Byte,
+              "key_cache must be uint8");
+  TORCH_CHECK(value_cache.scalar_type() == at::ScalarType::Byte,
+              "value_cache must be uint8");
+  TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+              "key and value must be 3D [num_tokens, num_heads, head_size]");
+  TORCH_CHECK(key_cache.dim() == 4 && value_cache.dim() == 4,
+              "key_cache and value_cache must be 4D packed caches");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::ScalarType::Long,
+              "slot_mapping must be int64");
+  TORCH_CHECK(key.size(0) >= slot_mapping.size(0) && value.size(0) >= slot_mapping.size(0),
+              "key/value must have at least slot_mapping.size(0) tokens");
+  TORCH_CHECK(key.size(1) == value.size(1) && key.size(2) == value.size(2),
+              "key and value must have matching shapes");
+  TORCH_CHECK(key.size(2) % 2 == 0, "head_size must be even");
+  TORCH_CHECK(key_cache.size(3) * 2 == key.size(2),
+              "packed key_cache last dim must equal head_size // 2");
+  TORCH_CHECK(value_cache.size(3) * 2 == value.size(2),
+              "packed value_cache last dim must equal head_size // 2");
+  TORCH_CHECK(key_cache.size(0) == value_cache.size(0) &&
+                  key_cache.size(1) == value_cache.size(1) &&
+                  key_cache.size(2) == value_cache.size(2) &&
+                  key_cache.size(3) == value_cache.size(3),
+              "key_cache and value_cache must have matching shapes");
+
+  const int num_tokens = slot_mapping.size(0);
+  const int num_heads = key.size(1);
+  const int head_size = key.size(2);
+  const int packed_head_size = key_cache.size(3);
+  const int block_size = key_cache.size(1);
+
+  dim3 grid(num_tokens, num_heads);
+  dim3 block(std::min(packed_head_size, 256));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  VLLM_DISPATCH_FLOATING_TYPES(key.scalar_type(),
+                               "turboquant_quantize_pack_and_cache", [&] {
+    vllm::turboquant_quantize_pack_and_cache_kernel<scalar_t>
+        <<<grid, block, 0, stream>>>(
+            key.data_ptr<scalar_t>(),
+            value.data_ptr<scalar_t>(),
+            key_cache.data_ptr<uint8_t>(),
+            value_cache.data_ptr<uint8_t>(),
+            slot_mapping.data_ptr<int64_t>(),
+            key.stride(0),
+            key.stride(1),
+            value.stride(0),
+            value.stride(1),
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            block_size,
+            head_size);
+  });
+}
+
 // KV_T is the data type of key and value tensors.
 // CACHE_T is the stored data type of kv-cache.
 // KV_DTYPE is the real data type of kv-cache.
